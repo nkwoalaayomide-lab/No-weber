@@ -1,37 +1,79 @@
+
 import requests
 import csv
+import argparse
+import time
 
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
+HEADERS = {
+    "User-Agent": "WeblessHunter/1.0 (business discovery project)"
+}
 
-def find_businesses(city, category):
-    print(f"Searching for {category} in {city}...")
+CATEGORIES = {
+    "restaurants": {
+        "amenity": ["restaurant", "cafe", "fast_food"]
+    },
+    "salons": {
+        "shop": ["hairdresser", "beauty"]
+    },
+    "hotels": {
+        "tourism": ["hotel", "guest_house", "hostel"]
+    },
+    "pharmacies": {
+        "amenity": ["pharmacy"]
+    },
+    "shops": {
+        "shop": ["supermarket", "convenience", "clothes", "electronics"]
+    }
+}
 
-    geocode_url = "https://nominatim.openstreetmap.org/search"
 
-    location = requests.get(
-        geocode_url,
+def get_location(location):
+    response = requests.get(
+        NOMINATIM_URL,
         params={
-            "q": city,
+            "q": location,
             "format": "json",
             "limit": 1
         },
-        headers={"User-Agent": "WeblessHunter/1.0"},
+        headers=HEADERS,
         timeout=30
-    ).json()
+    )
+    response.raise_for_status()
 
-    if not location:
-        print("Location not found.")
-        return
+    results = response.json()
 
-    south, north, west, east = location[0]["boundingbox"]
+    if not results:
+        raise ValueError("Location not found.")
+
+    return results[0]["boundingbox"]
+
+
+def search_businesses(location, category):
+    if category not in CATEGORIES:
+        raise ValueError(
+            f"Unknown category. Available: {', '.join(CATEGORIES)}"
+        )
+
+    south, north, west, east = get_location(location)
+
+    selectors = []
+
+    for key, values in CATEGORIES[category].items():
+        for value in values:
+            area = f"({south},{west},{north},{east})"
+
+            for element_type in ["node", "way", "relation"]:
+                selectors.append(
+                    f'{element_type}["{key}"="{value}"]["name"]{area};'
+                )
 
     query = f"""
-    [out:json][timeout:60];
+    [out:json][timeout:90];
     (
-      node["name"]["amenity"="{category}"]({south},{west},{north},{east});
-      way["name"]["amenity"="{category}"]({south},{west},{north},{east});
-      relation["name"]["amenity"="{category}"]({south},{west},{north},{east});
+        {"".join(selectors)}
     );
     out center tags;
     """
@@ -39,30 +81,103 @@ def find_businesses(city, category):
     response = requests.post(
         OVERPASS_URL,
         data={"data": query},
-        timeout=90
+        headers=HEADERS,
+        timeout=120
     )
     response.raise_for_status()
 
-    businesses = response.json()["elements"]
+    return response.json().get("elements", [])
 
-    with open("businesses.csv", "w", newline="", encoding="utf-8-sig") as file:
-        writer = csv.writer(file)
-        writer.writerow(["Business Name", "Phone", "Email", "Website"])
 
-        for business in businesses:
-            tags = business.get("tags", {})
-            writer.writerow([
-                tags.get("name", ""),
-                tags.get("phone", ""),
-                tags.get("email", ""),
-                tags.get("website", "")
-            ])
+def export_csv(businesses, location, category):
+    filename = f"{category}_leads.csv"
+    seen = set()
+    rows = []
 
-    print(f"Found {len(businesses)} businesses.")
-    print("Exported to businesses.csv")
+    for business in businesses:
+        tags = business.get("tags", {})
+        name = tags.get("name", "").strip()
+
+        if not name:
+            continue
+
+        osm_id = f'{business["type"]}/{business["id"]}'
+
+        if osm_id in seen:
+            continue
+
+        seen.add(osm_id)
+
+        coordinates = business.get("center", business)
+
+        website = (
+            tags.get("website")
+            or tags.get("contact:website")
+            or ""
+        )
+
+        rows.append({
+            "business_name": name,
+            "category": category,
+            "location": location,
+            "phone": tags.get("phone") or tags.get("contact:phone", ""),
+            "email": tags.get("email") or tags.get("contact:email", ""),
+            "website": website,
+            "website_status": (
+                "website_listed"
+                if website
+                else "no_website_listed_needs_verification"
+            ),
+            "latitude": coordinates.get("lat", ""),
+            "longitude": coordinates.get("lon", ""),
+            "osm_id": osm_id,
+            "source": "OpenStreetMap"
+        })
+
+    if not rows:
+        print("No businesses found.")
+        return
+
+    with open(filename, "w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"\nFound: {len(rows)} businesses")
+    print(f"CSV created: {filename}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Webless Hunter Business Discovery"
+    )
+
+    parser.add_argument("--location", required=True)
+    parser.add_argument(
+        "--category",
+        required=True,
+        choices=CATEGORIES.keys()
+    )
+
+    args = parser.parse_args()
+
+    print("WEBLESS HUNTER")
+    print("----------------------")
+    print(f"Location: {args.location}")
+    print(f"Category: {args.category}")
+    print("Searching OpenStreetMap APIs...")
+
+    businesses = search_businesses(
+        args.location,
+        args.category
+    )
+
+    export_csv(
+        businesses,
+        args.location,
+        args.category
+    )
 
 
 if __name__ == "__main__":
-    city = input("City: ")
-    category = input("Amenity category (e.g. restaurant, pharmacy): ")
-    find_businesses(city, category)
+    main()
